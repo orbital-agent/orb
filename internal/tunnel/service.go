@@ -100,16 +100,22 @@ func (s *Service) Expose(subdomain, port, serviceType, accessLevel, expires stri
 
 	configSaved := false
 	dnsAdded := false
+	accessCreated := false
 
+	// Each step is undone independently.
 	defer func() {
-		if !dnsAdded {
-			return
+		if accessCreated {
+			fmt.Printf("Rolling back: Removing access policy for %s...\n", host)
+			if err := s.cloudflare.RemoveAccessPolicy(host); err != nil {
+				fmt.Printf("Failed to rollback access policy for %s: %v\n", host, err)
+			}
 		}
 
-		// rollback and remove dns route
-		fmt.Printf("Rolling back: Removing DNS route for %s...\n", host)
-		if err := s.cloudflare.RemoveDNSRoute(orginalCfg.Tunnel, host); err != nil {
-			fmt.Printf("Failed to rollback DNS route for %s: %v\n", host, err)
+		if dnsAdded {
+			fmt.Printf("Rolling back: Removing DNS route for %s...\n", host)
+			if err := s.cloudflare.RemoveDNSRoute(orginalCfg.Tunnel, host); err != nil {
+				fmt.Printf("Failed to rollback DNS route for %s: %v\n", host, err)
+			}
 		}
 
 		if configSaved {
@@ -146,8 +152,11 @@ func (s *Service) Expose(subdomain, port, serviceType, accessLevel, expires stri
 			return fmt.Errorf("USER_EMAIL environment variable required for private access")
 		}
 		if err := s.cloudflare.CreateAccessPolicy(host, accessLevel, userEmail); err != nil {
+			// Mark it created even on failure.
+			accessCreated = true
 			return fmt.Errorf("failed to create access policy: %w", err)
 		}
+		accessCreated = true
 	}
 
 	// get tunnel name from tunnel ID
@@ -164,6 +173,7 @@ func (s *Service) Expose(subdomain, port, serviceType, accessLevel, expires stri
 	// reset rollback
 	configSaved = false
 	dnsAdded = false
+	accessCreated = false
 
 	// schedule access expiry if specified
 	if expires != "" && accessLevel != AccessLevelPublic && accessLevel != AccessLevelPrivate {
@@ -203,7 +213,26 @@ func (s *Service) Unexpose(subdomain string) error {
 	// get ingress index for hostname
 	idx := s.config.FindIngressIndex(cfg, host)
 	if idx == -1 {
-		return fmt.Errorf("✖ %s is not currently exposed", host)
+		// No ingress rule, but a failed expose can still have left a DNS record or an Access application behind.
+		fmt.Printf("ℹ️  %s has no ingress rule; checking for leftovers...\n", host)
+		found := false
+		if err := s.cloudflare.RemoveDNSRoute(cfg.Tunnel, host); err != nil {
+			fmt.Printf("  no DNS record removed (%v)\n", err)
+		} else {
+			fmt.Printf("  removed a stale DNS record for %s\n", host)
+			found = true
+		}
+		if err := s.cloudflare.RemoveAccessPolicy(host); err != nil {
+			fmt.Printf("  failed to remove access policy: %v\n", err)
+		} else {
+			fmt.Printf("  removed any access application for %s\n", host)
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("✖ %s is not currently exposed", host)
+		}
+		fmt.Printf("✔ Cleaned up leftovers for %s\n", host)
+		return nil
 	}
 
 	// start of TRANSACTION
@@ -213,15 +242,13 @@ func (s *Service) Unexpose(subdomain string) error {
 	configSaved := false
 	dnsRemoved := false
 
+	// As in Expose.
 	defer func() {
-		if !dnsRemoved {
-			return
-		}
-
-		// rollback and re create dns route
-		fmt.Printf("Rolling back: Re-adding DNS route for %s...\n", host)
-		if err := s.cloudflare.CreateDNSRoute(orginalCfg.Tunnel, host); err != nil {
-			fmt.Printf("Failed to rollback DNS route for %s: %v\n", host, err)
+		if dnsRemoved {
+			fmt.Printf("Rolling back: Re-adding DNS route for %s...\n", host)
+			if err := s.cloudflare.CreateDNSRoute(orginalCfg.Tunnel, host); err != nil {
+				fmt.Printf("Failed to rollback DNS route for %s: %v\n", host, err)
+			}
 		}
 
 		if configSaved {

@@ -8,8 +8,11 @@ A CLI tool for managing Cloudflare Tunnels with Zero Trust access control and sc
 - **Zero Trust access control** - public, private (owner-only), or group-based access
 - **Temporary access** - grant time-limited group access that auto-reverts to private
 - **Access groups** - manage who can access your services via Cloudflare Access
+- **Database management** - create, manage, and expose databases via Docker containers
 - **Scheduled tasks** - run scripts on a cron schedule with `orb schedule`
 - **Health monitoring** - check service status and view logs
+- **Configuration management** - easily view and edit orb settings
+- **Diagnostics** - run `orb doctor` to troubleshoot common issues
 - **Automatic DNS management** - creates/removes DNS records automatically
 
 ## Prerequisites
@@ -168,6 +171,14 @@ orb access create friends "alice@example.com,bob@example.com"
 # List all access groups
 orb access list
 
+# Show members of a group
+orb access show friends
+
+# Update group membership
+orb access update friends --add user3@example.com
+orb access update friends --remove user1@example.com
+orb access update friends -a new@example.com -r old@example.com
+
 # Delete an access group
 orb access delete friends
 ```
@@ -195,6 +206,112 @@ Cron format: `minute hour day month weekday`
 - `0 0 * * *` = daily at midnight
 - `0 9 * * 1` = Mondays at 9am
 
+### Database Commands
+
+Create and manage database containers via Docker, and expose them through Cloudflare Tunnel:
+
+#### Create and Manage Databases
+
+```bash
+# Create a new database container
+orb db create postgres mydb
+orb db create mysql app-db --port 3307
+orb db create redis cache
+
+# List all managed databases
+orb db list
+
+# Start/stop databases
+orb db start mydb
+orb db stop mydb
+
+# View database logs
+orb db logs mydb
+orb db logs mydb -f              # Follow logs
+orb db logs mydb -n 50           # Show last 50 lines
+
+# Show connection info
+orb db info mydb
+
+# Open interactive shell
+orb db shell mydb
+
+# Delete a database
+orb db delete mydb
+orb db delete mydb --keep-data   # Keep data directory
+```
+
+#### Expose Databases
+
+```bash
+# Expose a database through Cloudflare Tunnel (private by default)
+orb db expose postgres mydb
+orb db expose postgres mydb --port 5433
+orb db expose mysql app-db --access team
+orb db expose redis cache --access team --expires 24h
+
+# List supported database types
+orb db types
+```
+
+Supported database types:
+| Type | Description | Default Port |
+|------|-------------|--------------|
+| postgres | PostgreSQL | 5432 |
+| mysql | MySQL/MariaDB | 3306 |
+| redis | Redis | 6379 |
+| mongodb | MongoDB | 27017 |
+| memcached | Memcached | 11211 |
+| mssql | Microsoft SQL Server | 1433 |
+| clickhouse | ClickHouse | 9000 |
+| cassandra | Cassandra | 9042 |
+
+### Config Commands
+
+Manage orb configuration stored in `~/.config/orb/.env`:
+
+```bash
+# List all configuration values
+orb config list
+
+# Get a specific value
+orb config get DOMAIN
+
+# Set a configuration value
+orb config set DOMAIN mydomain.com
+
+# Remove a configuration value
+orb config unset SOME_KEY
+
+# Create a new config file with template
+orb config init
+orb config init --force          # Overwrite existing
+
+# Open config in your default editor
+orb config edit
+
+# Print the config file path
+orb config path
+```
+
+### Doctor Command
+
+Diagnose common issues with orb configuration:
+
+```bash
+orb doctor
+```
+
+Checks performed:
+- Environment variables (DOMAIN, CONFIG_PATH, CLOUDFLARE_*)
+- Config file existence and readability
+- cloudflared binary installation
+- cloudflared service status
+- Cloudflare API token validity
+- Zone and account access permissions
+- Internet connectivity
+- DNS resolution
+
 ## How It Works
 
 ### Tunnel Expose
@@ -219,7 +336,10 @@ orb/
 │   ├── root.go              # Root command
 │   ├── tunnel.go            # Tunnel subcommands
 │   ├── access.go            # Access group commands
-│   └── schedule.go          # Schedule commands
+│   ├── schedule.go          # Schedule commands
+│   ├── db.go                # Database management commands
+│   ├── config.go            # Configuration commands
+│   └── doctor.go            # Diagnostics command
 ├── internal/
 │   ├── dns/                 # Cloudflare API client
 │   │   └── client.go        # DNS, Access policies, groups
@@ -227,8 +347,14 @@ orb/
 │   │   ├── config.go        # Config file management
 │   │   ├── service.go       # Business logic
 │   │   └── validation.go    # Input validation
-│   └── scheduler/           # Cron schedule management
-│       └── service.go       # Add/remove/list schedules
+│   ├── scheduler/           # Cron schedule management
+│   │   └── service.go       # Add/remove/list schedules
+│   ├── database/            # Database container management
+│   │   └── service.go       # Docker database operations
+│   ├── config/              # Configuration management
+│   │   └── service.go       # .env file operations
+│   └── doctor/              # Diagnostics
+│       └── service.go       # Health checks
 ├── main.go                  # Entry point
 └── go.mod
 ```
@@ -238,6 +364,9 @@ orb/
 ~/.config/orb/
 ├── .env                     # Environment variables (API tokens, domain, etc.)
 └── schedules.json           # Persisted scheduled tasks
+
+~/.local/share/orb/
+└── databases/               # Database container data (created by orb db)
 ```
 
 ## Development

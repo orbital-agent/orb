@@ -172,22 +172,25 @@ func (s *Service) checkCloudflareAPIToken() {
 		return
 	}
 
-	// Verify token by making a simple API call
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := api.VerifyAPIToken(ctx)
-	if err != nil {
-		s.addCheck("Cloudflare API token", "fail", fmt.Sprintf("Token verification failed: %v", err))
-		return
-	}
-
-	if result.Status != "active" {
+	// VerifyAPIToken calls /user/tokens/verify, which only knows about user-owned tokens.
+	if result, verr := api.VerifyAPIToken(ctx); verr != nil {
+		if strings.HasPrefix(token, "cfat_") {
+			s.addCheck("Cloudflare API token", "ok",
+				"Account-owned token (cfat_); validated by the access checks below")
+		} else {
+			s.addCheck("Cloudflare API token", "fail",
+				fmt.Sprintf("Token verification failed: %v", verr))
+			return
+		}
+	} else if result.Status != "active" {
 		s.addCheck("Cloudflare API token", "fail", fmt.Sprintf("Token status: %s", result.Status))
 		return
+	} else {
+		s.addCheck("Cloudflare API token", "ok", "Token is valid and active")
 	}
-
-	s.addCheck("Cloudflare API token", "ok", "Token is valid and active")
 
 	// Check zone access
 	zoneID := os.Getenv("CLOUDFLARE_ZONE_ID")
@@ -200,14 +203,18 @@ func (s *Service) checkCloudflareAPIToken() {
 		}
 	}
 
-	// Check account access
+	// Check account access.
 	accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 	if accountID != "" {
-		_, _, err := api.Account(ctx, accountID)
+		_, _, err := api.ListAccessApplications(ctx,
+			cloudflare.AccountIdentifier(accountID),
+			cloudflare.ListAccessApplicationsParams{})
 		if err != nil {
-			s.addCheck("Account access", "fail", fmt.Sprintf("Cannot access account %s: %v", accountID, err))
+			s.addCheck("Account access", "fail",
+				fmt.Sprintf("Cannot use Access API on account %s: %v", accountID, err))
 		} else {
-			s.addCheck("Account access", "ok", fmt.Sprintf("Account %s accessible", accountID))
+			s.addCheck("Account access", "ok",
+				fmt.Sprintf("Account %s accessible (Access API)", accountID))
 		}
 	}
 }
