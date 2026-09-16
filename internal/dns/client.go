@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -168,8 +169,46 @@ func (c *Client) FollowServiceLogs(tunnelName string, hostname string) error {
 	return cmd.Run()
 }
 
-// CreateAccessPolicy creates a Cloudflare Access policy for a hostname
-// accessLevel can be "public", "private", or a group name
+// accessAppName is the Access application name orb uses for a hostname.
+func accessAppName(hostname string) string {
+	return fmt.Sprintf("orb-%s", hostname)
+}
+
+// accessAppsFor returns every Access application orb owns for hostname.
+func (c *Client) accessAppsFor(ctx context.Context, hostname string) ([]cloudflare.AccessApplication, error) {
+	// Empty params leaves cloudflare-go's auto-pagination on, so this sees every application instead of only the first page.
+	apps, _, err := c.api.ListAccessApplications(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessApplicationsParams{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list access applications: %w", err)
+	}
+
+	name := accessAppName(hostname)
+	var owned []cloudflare.AccessApplication
+	for _, app := range apps {
+		if app.Name == name {
+			owned = append(owned, app)
+		}
+	}
+
+	return owned, nil
+}
+
+// deleteAccessApps deletes each application, skipping keepID, and reports every failure rather than the first — a partial cleanup that stops early is what leaves duplicates behind.
+func (c *Client) deleteAccessApps(ctx context.Context, apps []cloudflare.AccessApplication, keepID string) error {
+	var errs []error
+	for _, app := range apps {
+		if app.ID == keepID {
+			continue
+		}
+		if err := c.api.DeleteAccessApplication(ctx, cloudflare.AccountIdentifier(c.accountID), app.ID); err != nil {
+			errs = append(errs, fmt.Errorf("delete access application %s: %w", app.ID, err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// CreateAccessPolicy creates a Cloudflare Access policy for a hostname accessLevel can be "public", "private", or a group name Re-exposing a hostname replaces its policy rather than stacking another one.
 func (c *Client) CreateAccessPolicy(hostname, accessLevel, userEmail string) error {
 	ctx := context.Background()
 
@@ -178,9 +217,14 @@ func (c *Client) CreateAccessPolicy(hostname, accessLevel, userEmail string) err
 		return nil
 	}
 
+	superseded, err := c.accessAppsFor(ctx, hostname)
+	if err != nil {
+		return err
+	}
+
 	// Create the access application
 	createdApp, err := c.api.CreateAccessApplication(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.CreateAccessApplicationParams{
-		Name:   fmt.Sprintf("orb-%s", hostname),
+		Name:   accessAppName(hostname),
 		Domain: hostname,
 		Type:   "self_hosted",
 	})
@@ -188,9 +232,22 @@ func (c *Client) CreateAccessPolicy(hostname, accessLevel, userEmail string) err
 		return fmt.Errorf("failed to create access application: %w", err)
 	}
 
+	// An application with no usable policy is worse than no application, and it would sit alongside the ones it was meant to replace.
+	if err := c.createAccessPolicies(ctx, createdApp.ID, hostname, accessLevel, userEmail); err != nil {
+		if rollbackErr := c.deleteAccessApps(ctx, []cloudflare.AccessApplication{createdApp}, ""); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		return err
+	}
+
+	return c.deleteAccessApps(ctx, superseded, createdApp.ID)
+}
+
+// createAccessPolicies attaches orb's policies to an application.
+func (c *Client) createAccessPolicies(ctx context.Context, appID, hostname, accessLevel, userEmail string) error {
 	// Always create owner policy first (precedence 1 - highest priority, cannot be altered)
-	_, err = c.api.CreateAccessPolicy(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.CreateAccessPolicyParams{
-		ApplicationID: createdApp.ID,
+	_, err := c.api.CreateAccessPolicy(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.CreateAccessPolicyParams{
+		ApplicationID: appID,
 		Name:          fmt.Sprintf("orb-%s-owner", hostname),
 		Decision:      "allow",
 		Include: []any{
@@ -204,171 +261,143 @@ func (c *Client) CreateAccessPolicy(hostname, accessLevel, userEmail string) err
 		return fmt.Errorf("failed to create owner access policy: %w", err)
 	}
 
-	// If not private, also add group access (precedence 2)
-	if accessLevel != "private" {
-		// Look up the group by name
-		groups, _, err := c.api.ListAccessGroups(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessGroupsParams{})
-		if err != nil {
-			return fmt.Errorf("failed to list access groups: %w", err)
-		}
+	// Private means owner-only, so there is no group to add.
+	if accessLevel == "private" {
+		return nil
+	}
 
-		var groupID string
-		for _, group := range groups {
-			if group.Name == accessLevel {
-				groupID = group.ID
-				break
-			}
-		}
+	groupID, err := c.accessGroupID(ctx, accessLevel)
+	if err != nil {
+		return err
+	}
 
-		if groupID == "" {
-			return fmt.Errorf("access group %q not found - create it with `orb access create %s <emails>` first", accessLevel, accessLevel)
-		}
-
-		// Create group policy (precedence 2)
-		_, err = c.api.CreateAccessPolicy(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.CreateAccessPolicyParams{
-			ApplicationID: createdApp.ID,
-			Name:          fmt.Sprintf("orb-%s-group", hostname),
-			Decision:      "allow",
-			Include: []any{
-				cloudflare.AccessGroupAccessGroup{Group: struct {
-					ID string `json:"id"`
-				}{ID: groupID}},
-			},
-			Precedence: 2,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create group access policy: %w", err)
-		}
+	// Create group policy (precedence 2)
+	_, err = c.api.CreateAccessPolicy(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.CreateAccessPolicyParams{
+		ApplicationID: appID,
+		Name:          fmt.Sprintf("orb-%s-group", hostname),
+		Decision:      "allow",
+		Include: []any{
+			cloudflare.AccessGroupAccessGroup{Group: struct {
+				ID string `json:"id"`
+			}{ID: groupID}},
+		},
+		Precedence: 2,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create group access policy: %w", err)
 	}
 
 	return nil
+}
+
+// accessGroupID resolves an Access group name to its ID.
+func (c *Client) accessGroupID(ctx context.Context, groupName string) (string, error) {
+	groups, _, err := c.api.ListAccessGroups(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessGroupsParams{})
+	if err != nil {
+		return "", fmt.Errorf("failed to list access groups: %w", err)
+	}
+
+	for _, group := range groups {
+		if group.Name == groupName {
+			return group.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("access group %q not found - create it with `orb access create %s <emails>` first", groupName, groupName)
 }
 
 // GetAccessInfo returns the access level for a hostname (e.g., "public", "private", or group name)
 func (c *Client) GetAccessInfo(hostname string) string {
 	ctx := context.Background()
 
-	// List all access applications
-	apps, _, err := c.api.ListAccessApplications(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessApplicationsParams{})
-	if err != nil {
+	apps, err := c.accessAppsFor(ctx, hostname)
+	if err != nil || len(apps) == 0 {
 		return "public"
 	}
 
-	// Find the application for this hostname
-	appName := fmt.Sprintf("orb-%s", hostname)
-	for _, app := range apps {
-		if app.Name == appName {
-			// Get the policies for this application
-			policies, _, err := c.api.ListAccessPolicies(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessPoliciesParams{
-				ApplicationID: app.ID,
-			})
-			if err != nil || len(policies) == 0 {
-				return "protected"
-			}
+	// CreateAccessPolicy prunes superseded applications, so there should only ever be one.
+	app := apps[0]
 
-			// Check the first policy's include rules to determine type
-			policy := policies[0]
-			if len(policy.Include) > 0 {
-				// Try to extract group information
-				for _, include := range policy.Include {
-					// Check if it's an email-based rule (private)
-					if emailRule, ok := include.(cloudflare.AccessGroupEmail); ok && emailRule.Email.Email != "" {
-						return "private"
-					}
-					// Check if it's a group-based rule
-					if groupRule, ok := include.(cloudflare.AccessGroupAccessGroup); ok && groupRule.Group.ID != "" {
-						// Look up the group name by ID
-						groups, _, err := c.api.ListAccessGroups(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessGroupsParams{})
-						if err == nil {
-							for _, group := range groups {
-								if group.ID == groupRule.Group.ID {
-									return group.Name
-								}
-							}
-						}
-						return "group"
+	// Get the policies for this application
+	policies, _, err := c.api.ListAccessPolicies(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessPoliciesParams{
+		ApplicationID: app.ID,
+	})
+	if err != nil || len(policies) == 0 {
+		return "protected"
+	}
+
+	// Check the first policy's include rules to determine type
+	for _, include := range policies[0].Include {
+		// Check if it's an email-based rule (private)
+		if emailRule, ok := include.(cloudflare.AccessGroupEmail); ok && emailRule.Email.Email != "" {
+			return "private"
+		}
+		// Check if it's a group-based rule
+		if groupRule, ok := include.(cloudflare.AccessGroupAccessGroup); ok && groupRule.Group.ID != "" {
+			// Look up the group name by ID
+			groups, _, err := c.api.ListAccessGroups(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessGroupsParams{})
+			if err == nil {
+				for _, group := range groups {
+					if group.ID == groupRule.Group.ID {
+						return group.Name
 					}
 				}
 			}
-			return "protected"
+			return "group"
 		}
 	}
 
-	return "public"
+	return "protected"
 }
 
-// RemoveAccessPolicy removes the Cloudflare Access policy for a hostname
+// RemoveAccessPolicy removes the Cloudflare Access policy for a hostname.
 func (c *Client) RemoveAccessPolicy(hostname string) error {
 	ctx := context.Background()
 
-	// List all access applications
-	apps, _, err := c.api.ListAccessApplications(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessApplicationsParams{})
+	apps, err := c.accessAppsFor(ctx, hostname)
 	if err != nil {
-		return fmt.Errorf("failed to list access applications: %w", err)
+		return err
 	}
 
-	// Find the application for this hostname
-	appName := fmt.Sprintf("orb-%s", hostname)
-	for _, app := range apps {
-		if app.Name == appName {
-			// Delete the application (this also deletes associated policies)
-			err := c.api.DeleteAccessApplication(ctx, cloudflare.AccountIdentifier(c.accountID), app.ID)
-			if err != nil {
-				return fmt.Errorf("failed to delete access application: %w", err)
-			}
-			return nil
-		}
-	}
-
-	// Not found is not an error
-	return nil
+	return c.deleteAccessApps(ctx, apps, "")
 }
 
-// RevokeGroupAccess removes only the group policy, keeping the owner policy intact
-// This is used when temporary access expires - reverts to private (owner-only)
+// RevokeGroupAccess removes only the group policy, keeping the owner policy intact This is used when temporary access expires - reverts to private (owner-only) Revoking across every application orb owns for the hostname, rather than the first, means a duplicate left by an older orb cannot keep group access alive after the expiry has supposedly reverted the host to private.
 func (c *Client) RevokeGroupAccess(hostname string) error {
 	ctx := context.Background()
 
-	// List all access applications
-	apps, _, err := c.api.ListAccessApplications(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessApplicationsParams{})
+	apps, err := c.accessAppsFor(ctx, hostname)
 	if err != nil {
-		return fmt.Errorf("failed to list access applications: %w", err)
+		return err
 	}
 
-	// Find the application for this hostname
-	appName := fmt.Sprintf("orb-%s", hostname)
+	groupPolicyName := fmt.Sprintf("orb-%s-group", hostname)
+
+	var errs []error
 	for _, app := range apps {
-		if app.Name == appName {
-			// List policies for this application
-			policies, _, err := c.api.ListAccessPolicies(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessPoliciesParams{
+		policies, _, err := c.api.ListAccessPolicies(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.ListAccessPoliciesParams{
+			ApplicationID: app.ID,
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("list access policies for %s: %w", app.ID, err))
+			continue
+		}
+
+		// Delete only the group policy, never the owner policy.
+		for _, policy := range policies {
+			if policy.Name != groupPolicyName {
+				continue
+			}
+			if err := c.api.DeleteAccessPolicy(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.DeleteAccessPolicyParams{
 				ApplicationID: app.ID,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to list access policies: %w", err)
+				PolicyID:      policy.ID,
+			}); err != nil {
+				errs = append(errs, fmt.Errorf("delete group policy %s: %w", policy.ID, err))
 			}
-
-			// Find and delete only the group policy (not the owner policy)
-			groupPolicyName := fmt.Sprintf("orb-%s-group", hostname)
-			for _, policy := range policies {
-				if policy.Name == groupPolicyName {
-					err := c.api.DeleteAccessPolicy(ctx, cloudflare.AccountIdentifier(c.accountID), cloudflare.DeleteAccessPolicyParams{
-						ApplicationID: app.ID,
-						PolicyID:      policy.ID,
-					})
-					if err != nil {
-						return fmt.Errorf("failed to delete group policy: %w", err)
-					}
-					return nil
-				}
-			}
-
-			// No group policy found - already private
-			return nil
 		}
 	}
 
-	// No application found
-	return nil
+	return errors.Join(errs...)
 }
 
 // CreateAccessGroup creates a new Access group with email addresses

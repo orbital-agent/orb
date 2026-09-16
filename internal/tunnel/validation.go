@@ -43,8 +43,7 @@ func ValidateServiceType(t string) error {
 	return fmt.Errorf("invalid service type %q: must be one of %v", t, ValidServiceTypes)
 }
 
-// ValidateAccessLevel checks if an access level is valid
-// Accepts "public", "private", or any group name
+// ValidateAccessLevel checks if an access level is valid Accepts "public", "private", or any group name.
 func ValidateAccessLevel(level string) error {
 	if level == "" {
 		return fmt.Errorf("access level cannot be empty")
@@ -88,14 +87,4 @@ func ParseExpiresDuration(expires string) (time.Duration, error) {
 	}
 }
 
-// CURRENTLY DISABLED FOR BETTER DESIGN PRACTICES
-// EnsurePortListening checks if a service is listening on the given port
-// func EnsurePortListening(port string) error {
-// 	addr := "127.0.0.1:" + port
-// 	conn, err := net.DialTimeout("tcp", addr, 800*time.Millisecond)
-// 	if err != nil {
-// 		return fmt.Errorf("nothing listening on %s - start your service first", addr)
-// 	}
-// 	conn.Close()
-// 	return nil
-// }
+// CURRENTLY DISABLED FOR BETTER DESIGN PRACTICES EnsurePortListening checks if a service is listening on the given port func EnsurePortListening(port string) error { addr := "127.0.0.1:" + port conn, err := net.DialTimeout("tcp", addr, 800*time.Millisecond) if err != nil { return fmt.Errorf("nothing listening on %s - start your service first", addr) } conn.Close() return nil }.
